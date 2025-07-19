@@ -1,0 +1,178 @@
+//@version=5
+strategy("Rob Hoffman IRB Strategy by SniffDogz", overlay=true, max_labels_count=1, close_entries_rule='ANY', default_qty_value=100, default_qty_type=strategy.cash, initial_capital=1000, commission_type=strategy.commission.percent, commission_value=0.05, process_orders_on_close=true, margin_long=0, margin_short=0)
+
+// Inputs
+irbPercentage = input.float(20, "Inventory Retracement Percentage %", minval=0, maxval=100)
+emaLengthShort = input.int(5, "Short EMA Length", minval=1)
+emaLengthMedium = input.int(13, "Medium EMA Length", minval=1)
+emaLengthLong = input.int(34, "Long EMA Length", minval=1)
+slopeThreshold = input.float(21, "EMA Slope Threshold (degrees)", minval=0, maxval=90)
+htfTimeframe = input.timeframe("240", "Higher Timeframe for Trend (4H)")
+breakoutBars = input.int(10, "Breakout Bar Limit", minval=1)
+atrLength = input.int(14, "ATR Length", minval=1)
+tp1Ratio = input.float(1.8, "Take-Profit 1 Ratio", minval=0.1, step=0.1, tooltip="Risk-Reward ratio for TP1")
+tp2Ratio = input.float(2.0, "Take-Profit 2 Ratio", minval=0.1, step=0.1, tooltip="Risk-Reward ratio for TP2")
+tp1Percent = input.float(85, "TP1 Position Size (% of Total)", minval=10, maxval=90, step=5, tooltip="Percentage of position to exit at TP1")
+volumeThreshold = input.float(1.5, "Volume Multiplier", minval=1.0, step=0.1)
+initialAtrMultiplier = input.float(4, "Initial ATR Multiplier", minval=0.1, step=0.1)
+trailingAtrMultiplier = input.float(4, "Trailing ATR Multiplier", minval=0.1, step=0.1)
+trailLookback = input.int(10, "Trailing Lookback Period", minval=1)
+minStopPercent = input.float(0.5, "Min Stop Distance (% of Price)", minval=0.1, step=0.1)
+riskPercent = input.float(9.9, "Risk Per Trade (% of Capital)", minval=0.1, maxval=100.0, step=0.1)
+useTimeFilter = input.bool(false, "Use Trading Session Filter")
+sessionTime = input.session("0700-1500", "Trading Session (UTC)", options=["0700-1500", "1300-2000", "0000-2359"], tooltip="London: 0700-1500, NY: 1300-2000, All Day: 0000-2359")
+
+// Time Filter
+inSession = time(timeframe.period, sessionTime, "UTC")
+isTradeTime = useTimeFilter ? inSession : true
+
+// Higher Timeframe EMA (4-hour)
+htfEma = request.security(syminfo.tickerid, htfTimeframe, ta.ema(close, emaLengthMedium), lookahead=barmerge.lookahead_on)
+htfIsUptrend = htfEma > htfEma[1]
+htfIsDowntrend = htfEma < htfEma[1]
+
+// Overlay Set EMAs
+emaShort = ta.ema(close, emaLengthShort)
+emaMedium = ta.ema(close, emaLengthMedium)
+emaLong = ta.ema(close, emaLengthLong)
+
+// Trend Confirmation with Overlay Set
+isUptrendLocal = emaShort > emaMedium and emaMedium > emaLong
+isDowntrendLocal = emaShort < emaMedium and emaMedium < emaLong
+
+// Slope Calculation (approximation)
+slope = ta.change(emaMedium) / close * 100
+isUptrendSlope = slope > math.tan(slopeThreshold * math.pi / 180)
+isDowntrendSlope = slope < -math.tan(slopeThreshold * math.pi / 180)
+
+// Combined Trend Conditions
+isUptrend = isUptrendLocal and isUptrendSlope and htfIsUptrend
+isDowntrend = isDowntrendLocal and isDowntrendSlope and htfIsDowntrend
+
+// IRB Identification
+candleRange = math.abs(high - low)
+candleBody = math.abs(close - open)
+retracementPercent = candleBody / candleRange * 100
+isIRBLong = retracementPercent >= irbPercentage and close < high and open < high and isUptrend
+isIRBShort = retracementPercent >= irbPercentage and close > low and open > low and isDowntrend
+
+// Volume Filter
+volumeFilter = ta.sma(volume, 10) * volumeThreshold
+isVolumeValid = volume > volumeFilter
+
+// Breakout/breakdown Signals with Bar Limit
+var float irbHigh = na
+var float irbLow = na
+var int irbBarCount = 0
+var bool isIRBActive = false
+
+if isIRBLong[1]
+    irbHigh := high[1]
+    irbLow := low[1]
+    irbBarCount := 0
+    isIRBActive := true
+else if isIRBShort[1]
+    irbHigh := high[1]
+    irbLow := low[1]
+    irbBarCount := 0
+    isIRBActive := true
+else if isIRBActive
+    irbBarCount := irbBarCount + 1
+    if irbBarCount > breakoutBars
+        isIRBActive := false
+        irbHigh := na
+        irbLow := na
+
+buySignal = ta.crossover(close, irbHigh) and isIRBActive and isUptrend and isVolumeValid and isTradeTime
+sellSignal = ta.crossunder(close, irbLow) and isIRBActive and isDowntrend and isVolumeValid and isTradeTime
+
+// ATR and Volatility Adjustment
+atr = ta.atr(atrLength)
+atrp = atr / close * 100  // ATR as percentage of price
+atrMultiplier = initialAtrMultiplier * (1 + atrp / 100)  // Scale multiplier with volatility
+minStopDistance = close * minStopPercent / 100
+
+// Initial Stop-Loss
+stopLossLong = irbLow - atr * atrMultiplier
+stopLossLong := math.max(stopLossLong, irbLow - minStopDistance)  // Enforce minimum stop
+stopLossShort = irbHigh + atr * atrMultiplier
+stopLossShort := math.min(stopLossShort, irbHigh + minStopDistance)  // Enforce minimum stop
+
+// Trailing Stop-Loss (Chandelier Exit style)
+highestHigh = ta.highest(high, trailLookback)
+lowestLow = ta.lowest(low, trailLookback)
+trailStopLong = highestHigh - atr * trailingAtrMultiplier
+trailStopShort = lowestLow + atr * trailingAtrMultiplier
+
+// Take Profit Levels
+takeProfitLong1 = irbHigh + atr * tp1Ratio
+takeProfitLong2 = irbHigh + atr * tp2Ratio
+takeProfitShort1 = irbLow - atr * tp1Ratio
+takeProfitShort2 = irbLow - atr * tp2Ratio
+
+// Dynamic Position Sizing
+equity = strategy.equity
+stopDistanceLong = close - stopLossLong
+stopDistanceShort = stopLossShort - close
+contractsLong = math.floor((equity * riskPercent / 100) / stopDistanceLong)
+contractsShort = math.floor((equity * riskPercent / 100) / stopDistanceShort)
+contractsLong := math.max(1, contractsLong)  // Ensure at least 1 contract
+contractsShort := math.max(1, contractsShort)  // Ensure at least 1 contract
+
+// Position Split for TP1 and TP2
+tp1ContractsLong = math.floor(contractsLong * tp1Percent / 100)
+tp1ContractsShort = math.floor(contractsShort * tp1Percent / 100)
+tp2ContractsLong = contractsLong - tp1ContractsLong
+tp2ContractsShort = contractsShort - tp1ContractsShort
+
+// Breakeven Logic
+var float breakevenPriceLong = na
+var float breakevenPriceShort = na
+var bool tp1HitLong = false
+var bool tp1HitShort = false
+
+if buySignal
+    breakevenPriceLong := close
+    tp1HitLong := false
+
+if sellSignal
+    breakevenPriceShort := close
+    tp1HitShort := false
+
+// Update Breakeven when TP1 is hit
+if strategy.position_size > 0 and close >= takeProfitLong1 and not tp1HitLong
+    tp1HitLong := true
+
+if strategy.position_size < 0 and close <= takeProfitShort1 and not tp1HitShort
+    tp1HitShort := true
+
+// Strategy Execution with Two TPs and Breakeven
+if buySignal
+    strategy.entry("Long TP1", strategy.long, qty=tp1ContractsLong)
+    strategy.entry("Long TP2", strategy.long, qty=tp2ContractsLong)
+    strategy.exit("Exit Long TP1", "Long TP1", limit=takeProfitLong1)
+    strategy.exit("Exit Long TP2", "Long TP2", stop=tp1HitLong ? breakevenPriceLong : trailStopLong, limit=takeProfitLong2)
+
+if sellSignal
+    strategy.entry("Short TP1", strategy.short, qty=tp1ContractsShort)
+    strategy.entry("Short TP2", strategy.short, qty=tp2ContractsShort)
+    strategy.exit("Exit Short TP1", "Short TP1", limit=takeProfitShort1)
+    strategy.exit("Exit Short TP2", "Short TP2", stop=tp1HitShort ? breakevenPriceShort : trailStopShort, limit=takeProfitShort2)
+
+// Plotting Signals and EMAs
+plotshape(buySignal, style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, title="Buy Signal")
+plotshape(sellSignal, style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, title="Sell Signal")
+plot(emaShort, color=color.blue, title="EMA 5")
+plot(emaMedium, color=color.orange, title="EMA 13")
+plot(emaLong, color=color.purple, title="EMA 34")
+plot(htfEma, color=color.yellow, title="4H EMA 13")
+// Plot trailing stops and breakeven conditionally
+plotLongStop = strategy.position_size > 0 ? (tp1HitLong ? breakevenPriceLong : trailStopLong) : na
+plotShortStop = strategy.position_size < 0 ? (tp1HitShort ? breakevenPriceShort : trailStopShort) : na
+plot(plotLongStop, color=color.red, title="Long Stop", display=display.all)
+plot(plotShortStop, color=color.red, title="Short Stop", display=display.all)
+// Plot TP levels
+plot(strategy.position_size > 0 ? takeProfitLong1 : na, color=color.green, style=plot.style_cross, title="TP1 Long")
+plot(strategy.position_size > 0 ? takeProfitLong2 : na, color=color.green, style=plot.style_cross, title="TP2 Long")
+plot(strategy.position_size < 0 ? takeProfitShort1 : na, color=color.green, style=plot.style_cross, title="TP1 Short")
+plot(strategy.position_size < 0 ? takeProfitShort2 : na, color=color.green, style=plot.style_cross, title="TP2 Short")
