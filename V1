@@ -1,0 +1,276 @@
+//@version=5
+strategy('v1.08 Smart Grid Bot Final', overlay=true, pyramiding=800, close_entries_rule='ANY', default_qty_type=strategy.cash, initial_capital=1000.0, currency='USD', commission_type=strategy.commission.percent, commission_value=0.05, max_bars_back=500, max_lines_count=500, max_polylines_count=100)
+
+// Date condition inputs
+startDate = input.time(timestamp("1 January 2018 00:00 +0000"), "Start Date", group="Main Algo Settings")
+endDate = input.time(timestamp("31 Dec 2069 23:59 +0000"), "End Date", group="Main Algo Settings")
+timeCondition = time >= startDate and time <= endDate
+
+// Input parameters
+i_upperBound = input.float(group='Grid Bounds', title='Upper Range', defval=200000)
+i_lowerBound = input.float(group='Grid Bounds', title='Lower Range', defval=70000)
+i_gridQty = input.int(group='Grid Lines', title='Grid Line Quantity', defval=250, maxval=800, minval=3)
+tp_multiplier = input.float(2.5, "TP Multiplier", minval=1.0, step=0.1, group="Grid Lines")
+
+// Max Buy and Sell Signals
+i_maxBuySignals = input.int(4, "Max Buy Signals per Trigger", minval=1, maxval=12, group="Grid Lines")
+i_maxSellSignals = input.int(4, "Max Sell Signals per Trigger", minval=1, maxval=12, group="Grid Lines")
+
+// RSI Settings
+rsiLengthInput = input.int(99, title='RSI Length', minval=1, group='RSI Settings')
+rsiSourceInput = input.source(close, title='Source', group='RSI Settings')
+rsi_OS = input.int(25, title='RSI Oversold', minval=1, group='RSI Settings')
+signalPeriod = 1
+
+// RSI Calculation
+change = ta.change(rsiSourceInput)
+up = ta.rma(math.max(change, 0), rsiLengthInput)
+down = ta.rma(-math.min(change, 0), rsiLengthInput)
+rsi = down == 0 ? 100 : up == 0 ? 0 : 100 - 100 / (1 + up / down)
+
+// Signal Tracking
+var int activeRSISignal = 0
+var int rsiBarsRemaining = 0
+var bool newRSIBuySignal = false
+
+buyTrigger = ta.crossover(rsi, rsi_OS)
+sellTrigger = ta.crossunder(rsi, 70)
+
+if buyTrigger
+    activeRSISignal := 1
+    rsiBarsRemaining := signalPeriod
+    newRSIBuySignal := true
+else if sellTrigger
+    activeRSISignal := -1
+    rsiBarsRemaining := signalPeriod
+    newRSIBuySignal := false
+else if rsiBarsRemaining > 0
+    rsiBarsRemaining -= 1
+    newRSIBuySignal := false
+else
+    activeRSISignal := 0
+    newRSIBuySignal := false
+
+buyRSIActive = activeRSISignal == 1 and rsiBarsRemaining > 0
+plotshape(buyRSIActive, title='RSI Buy', location=location.belowbar, style=shape.diamond, size=size.small, color=color.new(color.green, 0))
+
+// Track new RSI Sell Signal
+var bool newRSISellSignal = false
+newRSISellSignal := sellTrigger and not sellTrigger[1]
+
+// T3
+useT3 = true
+crossT3 = input.bool(true, 'Cross confirmation? - T3')
+inverseT3 = input.bool(false, 'Inverse? - T3')
+lengthT3 = input(title='Length - T3', defval=70)
+factorT3 = input.float(title='Factor - T3', minval=0, maxval=1, defval=0.7)
+highlightMovementsT3 = input(title='Highlight Movements? - T3', defval=true)
+srcT3 = input(title='Source - T3', defval=close)
+
+gdT3(srcT3, lengthT3) =>
+    ta.ema(srcT3, lengthT3) * (1 + factorT3) - ta.ema(ta.ema(srcT3, lengthT3), lengthT3) * factorT3
+
+t3 = gdT3(gdT3(gdT3(srcT3, lengthT3), lengthT3), lengthT3)
+t3Color = highlightMovementsT3 ? t3 > t3[1] ? color.green : color.red : #6d1e7f
+t3Signals = t3 > t3[1] ? 1 : -1
+basicLongCondition = t3Signals > 0 and close > t3
+t3SignalsLong = useT3 ? (highlightMovementsT3 ? basicLongCondition : close > t3) : true
+t3SignalsShort = useT3 ? (highlightMovementsT3 ? t3Signals < 0 and close < t3 : close < t3) : true
+t3SignalsLongCross = crossT3 ? not t3SignalsLong[1] and t3SignalsLong : t3SignalsLong
+t3SignalsShortCross = crossT3 ? not t3SignalsShort[1] and t3SignalsShort : t3SignalsShort
+t3SignalsLongFinal = inverseT3 ? t3SignalsShortCross : t3SignalsLongCross
+t3SignalsShortFinal = inverseT3 ? t3SignalsLongCross : t3SignalsShortCross
+
+// New T3 Signal Tracking
+var bool newT3BuySignal = false
+newT3BuySignal := t3SignalsLongFinal and not t3SignalsLongFinal[1]
+
+// Track new T3 Sell Signal
+var bool newT3SellSignal = false
+newT3SellSignal := t3SignalsShortFinal and not t3SignalsShortFinal[1]
+
+// Heartbeat Plots
+plot(t3SignalsLongFinal ? 1 : 0, 'Heartbeat Long', display=display.data_window)
+plot(t3SignalsShortFinal ? -1 : 0, 'Heartbeat Short', display=display.data_window)
+plot(useT3 ? t3 : na, title='T3', linewidth=2, color=t3Color)
+
+// Grid build function (add this if missing)
+f_buildGrid(_lowerBound, _gridWidth, _gridQty) =>
+    var float[] gridLines = array.new_float()
+    for i = 0 to _gridQty - 1
+        array.push(gridLines, _lowerBound + _gridWidth * i)
+    gridLines
+
+// Function to get nearest grid lines around price (if missing, create)
+f_getNearGridLines(_gridArr, _price) =>
+    var float nearestAbove = na
+    var float nearestBelow = na
+    for i = 0 to array.size(_gridArr) - 1
+        val = array.get(_gridArr, i)
+        if val >= _price and (na(nearestAbove) or val < nearestAbove)
+            nearestAbove := val
+        if val <= _price and (na(nearestBelow) or val > nearestBelow)
+            nearestBelow := val
+    [nearestAbove, nearestBelow]
+
+// Calculate grid parameters
+gridWidth = (i_upperBound - i_lowerBound) / (i_gridQty - 1)
+var gridLineArr = f_buildGrid(i_lowerBound, gridWidth, i_gridQty)
+
+// Initialize order tracking arrays
+var orderArr = array.new_bool(i_gridQty, false)     // For buy signals
+var orderSellArr = array.new_bool(i_gridQty, false) // For sell signals
+
+// Buy Logic with Max Buy Signal Limit (triggered only once per new signal)
+if (newRSIBuySignal or newT3BuySignal) and timeCondition
+    buyCount = 0
+    for i = 0 to array.size(gridLineArr) - 1
+        if buyCount >= i_maxBuySignals
+            break
+        gridPrice = array.get(gridLineArr, i)
+        if close < gridPrice and not array.get(orderArr, i)
+            array.set(orderArr, i, true)
+            strategy.entry(id="GridBuy#" + str.tostring(i), direction=strategy.long, qty=strategy.initial_capital / (i_gridQty - 1) / close, comment="#" + str.tostring(i))
+            buyCount += 1
+
+
+// Exit Logic for buys
+for i = 0 to array.size(gridLineArr) - 2
+    if array.get(orderArr, i)
+        entry_price = array.get(gridLineArr, i)
+        exit_price = entry_price + (gridWidth * tp_multiplier)
+        if close > exit_price
+            array.set(orderArr, i, false)
+            strategy.close(id="GridBuy#" + str.tostring(i), comment="#" + str.tostring(i))
+
+// Sell Signal Logic: Use to close longs only, no short positions
+if (newRSISellSignal or newT3SellSignal) and timeCondition
+    for i = 0 to array.size(gridLineArr) - 1
+        if array.get(orderArr, i)
+            entry_price = array.get(gridLineArr, i)
+            exit_price = entry_price + (gridWidth * tp_multiplier)
+            if close > exit_price
+                array.set(orderArr, i, false)
+                strategy.close(id="GridBuy#" + str.tostring(i), comment="SellSignalClose#" + str.tostring(i))
+
+
+
+// The rest of your script (plotting grid lines, dashboard, monthly performance, etc.) remains unchanged...
+
+// Plotting grid lines
+//for i = 0 to array.size(gridLineArr) - 1 by 1
+ //   var line gridLine = na
+ // gridLine := line.new(x1=bar_index - 100, y1=array.get(gridLineArr, i), x2=bar_index, y2=array.get(gridLineArr, i), color=color.new(color.blue, 0), width=1)
+ //   line.set_x1(gridLine, bar_index - 9990)
+ //   line.set_x2(gridLine, bar_index)
+
+// ... your dashboard and monthly performance code here (unchanged)
+
+
+
+// Dashboard Performance Table
+i_tableTextSize = input.string(title="Dashboard Size", defval="Small", options=["Auto", "Huge", "Large", "Normal", "Small", "Tiny"], group="Dashboards")
+table_text_size(s) =>
+    switch s
+        "Auto" => size.auto
+        "Huge" => size.huge
+        "Large" => size.large
+        "Normal" => size.normal
+        "Small" => size.small
+        => size.tiny
+tableTextSize = table_text_size(i_tableTextSize)
+
+f_fillCell(_table, _column, _row, _title, _value, _bgcolor, _txtcolor) =>
+    table.cell(_table, _column, _row, _title + "\n" + _value, bgcolor=_bgcolor, text_color=_txtcolor, text_size=tableTextSize)
+
+i_showDashboard = input.bool(title="Performance Summary", defval=false, group="Dashboards", inline="Show Dashboards")
+if i_showDashboard
+    var bgcolor = color.new(color.black, 0)
+    newWin = (strategy.wintrades > strategy.wintrades[1]) and (strategy.losstrades == strategy.losstrades[1]) and (strategy.eventrades == strategy.eventrades[1])
+    newLoss = (strategy.wintrades == strategy.wintrades[1]) and (strategy.losstrades > strategy.losstrades[1]) and (strategy.eventrades == strategy.eventrades[1])
+    varip int winRow = 0
+    varip int lossRow = 0
+    varip int maxWinRow = 0
+    varip int maxLossRow = 0
+    if newWin
+        lossRow := 0
+        winRow := winRow + 1
+    if winRow > maxWinRow
+        maxWinRow := winRow
+    if newLoss
+        winRow := 0
+        lossRow := lossRow + 1
+    if lossRow > maxLossRow
+        maxLossRow := lossRow
+    var table dashTable = table.new(position.top_right, 1, 15, border_width=1)
+    if barstate.islastconfirmedhistory
+        dollarReturn = strategy.netprofit
+        f_fillCell(dashTable, 0, 0, "Start:", str.format("{0,date,long}", strategy.closedtrades.entry_time(0)), bgcolor, color.white)
+        f_fillCell(dashTable, 0, 1, "End:", str.format("{0,date,long}", strategy.opentrades.entry_time(0)), bgcolor, color.white)
+        _profit = (strategy.netprofit / strategy.initial_capital) * 100
+        f_fillCell(dashTable, 0, 2, "Net Profit:", str.tostring(_profit, '##.##') + "%", _profit > 0 ? color.teal : color.maroon, color.white)
+        _numOfDaysInStrategy = (strategy.opentrades.entry_time(0) - strategy.closedtrades.entry_time(0)) / (1000 * 3600 * 24)
+        f_fillCell(dashTable, 0, 3, "Percent Per Day", str.tostring(_profit / _numOfDaysInStrategy, '#########################.#####') + "%", _profit > 0 ? color.teal : color.maroon, color.white)
+        _winRate = (strategy.wintrades / strategy.closedtrades) * 100
+        f_fillCell(dashTable, 0, 4, "Percent Profitable:", str.tostring(_winRate, '##.##') + "%", _winRate < 50 ? color.maroon : _winRate < 75 ? #999900 : color.teal, color.white)
+        f_fillCell(dashTable, 0, 5, "Profit Factor:", str.tostring(strategy.grossprofit / strategy.grossloss, '##.###'), strategy.grossprofit > strategy.grossloss ? color.teal : color.maroon, color.white)
+        f_fillCell(dashTable, 0, 6, "Total Trades:", str.tostring(strategy.closedtrades), bgcolor, color.white)
+        f_fillCell(dashTable, 0, 8, "Max Wins In A Row:", str.tostring(maxWinRow, '######'), bgcolor, color.white)
+        f_fillCell(dashTable, 0, 9, "Max Losses In A Row:", str.tostring(maxLossRow, '######'), bgcolor, color.white)
+
+// Monthly Table Performance Dashboard
+i_showMonthlyPerformance = input.bool(false, 'Monthly Performance', group='Dashboards', inline="Show Dashboards")
+i_monthlyReturnPercision = 2
+if i_showMonthlyPerformance
+    new_month = month(time) != month(time[1])
+    new_year = year(time) != year(time[1])
+    eq = strategy.equity
+    bar_pnl = eq / eq[1] - 1
+    cur_month_pnl = 0.0
+    cur_year_pnl = 0.0
+    cur_month_pnl := new_month ? 0.0 : (1 + cur_month_pnl[1]) * (1 + bar_pnl) - 1
+    cur_year_pnl := new_year ? 0.0 : (1 + cur_year_pnl[1]) * (1 + bar_pnl) - 1
+    var month_pnl = array.new_float(0)
+    var month_time = array.new_int(0)
+    var year_pnl = array.new_float(0)
+    var year_time = array.new_int(0)
+    last_computed = false
+    if (not na(cur_month_pnl[1]) and (new_month or barstate.islastconfirmedhistory))
+        if (last_computed[1])
+            array.pop(month_pnl)
+            array.pop(month_time)
+        array.push(month_pnl, cur_month_pnl[1])
+        array.push(month_time, time[1])
+    if (not na(cur_year_pnl[1]) and (new_year or barstate.islastconfirmedhistory))
+        if (last_computed[1])
+            array.pop(year_pnl)
+            array.pop(year_time)
+        array.push(year_pnl, cur_year_pnl[1])
+        array.push(year_time, time[1])
+    last_computed := barstate.islastconfirmedhistory ? true : nz(last_computed[1])
+    var monthly_table = table(na)
+    if (barstate.islastconfirmedhistory)
+        monthly_table := table.new(position.bottom_right, columns=14, rows=array.size(year_pnl) + 1, border_width=1)
+        table.cell(monthly_table, 0, 0, "", bgcolor=#cccccc, text_size=tableTextSize)
+        table.cell(monthly_table, 1, 0, "Jan", bgcolor=#cccccc, text_size=tableTextSize)
+        table.cell(monthly_table, 2, 0, "Feb", bgcolor=#cccccc, text_size=tableTextSize)
+        table.cell(monthly_table, 3, 0, "Mar", bgcolor=#cccccc, text_size=tableTextSize)
+        table.cell(monthly_table, 4, 0, "Apr", bgcolor=#cccccc, text_size=tableTextSize)
+        table.cell(monthly_table, 5, 0, "May", bgcolor=#cccccc, text_size=tableTextSize)
+        table.cell(monthly_table, 6, 0, "Jun", bgcolor=#cccccc, text_size=tableTextSize)
+        table.cell(monthly_table, 7, 0, "Jul", bgcolor=#cccccc, text_size=tableTextSize)
+        table.cell(monthly_table, 8, 0, "Aug", bgcolor=#cccccc, text_size=tableTextSize)
+        table.cell(monthly_table, 9, 0, "Sep", bgcolor=#cccccc, text_size=tableTextSize)
+        table.cell(monthly_table, 10, 0, "Oct", bgcolor=#cccccc, text_size=tableTextSize)
+        table.cell(monthly_table, 11, 0, "Nov", bgcolor=#cccccc, text_size=tableTextSize)
+        table.cell(monthly_table, 12, 0, "Dec", bgcolor=#cccccc, text_size=tableTextSize)
+        table.cell(monthly_table, 13, 0, "Year", bgcolor=#999999, text_size=tableTextSize)
+        for yi = 0 to array.size(year_pnl) - 1
+            table.cell(monthly_table, 0, yi + 1, str.tostring(year(array.get(year_time, yi))), bgcolor=#cccccc, text_size=tableTextSize)
+            y_color = array.get(year_pnl, yi) > 0 ? color.new(color.teal, transp=40) : color.new(color.gray, transp=40)
+            table.cell(monthly_table, 13, yi + 1, str.tostring(math.round(array.get(year_pnl, yi) * 100, i_monthlyReturnPercision)), bgcolor=y_color, text_color=color.new(color.white, 0), text_size=tableTextSize)
+        for mi = 0 to array.size(month_time) - 1
+            m_row = year(array.get(month_time, mi)) - year(array.get(year_time, 0)) + 1
+            m_col = month(array.get(month_time, mi))
+            m_color = array.get(month_pnl, mi) > 0 ? color.new(color.teal, transp=40) : color.new(color.maroon, transp=40)
+            table.cell(monthly_table, m_col, m_row, str.tostring(math.round(array.get(month_pnl, mi) * 100, i_monthlyReturnPercision)), bgcolor=m_color, text_color=color.new(color.white, 0), text_size=tableTextSize)
